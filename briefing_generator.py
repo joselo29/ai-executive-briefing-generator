@@ -6,11 +6,14 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
-import google.generativeai as genai
 import pandas as pd
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt, RGBColor
@@ -47,18 +50,38 @@ def data_loader(path: Path = DATA_PATH) -> pd.DataFrame:
     return df
 
 
-def _configure_gemini() -> genai.GenerativeModel:
+def _configure_gemini() -> genai.Client:
     load_dotenv(ROOT / ".env")
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY missing from .env")
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(MODEL_NAME)
+    return genai.Client(api_key=api_key)
 
 
-def _call_gemini(model: genai.GenerativeModel, prompt: str, **kwargs) -> str:
-    response = model.generate_content(prompt, **kwargs)
-    return (response.text or "").strip()
+_RETRY_WAITS = (5, 10, 20)
+_RETRY_CODES = {429, 503}
+
+
+def _call_gemini(client: genai.Client, prompt: str, **kwargs) -> str:
+    attempt = 0
+    while True:
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME, contents=prompt, **kwargs
+            )
+            return (response.text or "").strip()
+        except genai_errors.APIError as exc:
+            code = getattr(exc, "code", None)
+            if code not in _RETRY_CODES or attempt >= len(_RETRY_WAITS):
+                raise
+            wait = _RETRY_WAITS[attempt]
+            attempt += 1
+            print(
+                f"[retry] Gemini overloaded — waiting {wait}s and retrying "
+                f"(attempt {attempt}/3)...",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
 
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*|\s*```", re.MULTILINE)
@@ -74,7 +97,7 @@ def _extract_json(raw: str) -> dict:
 
 def schema_discovery(
     df: pd.DataFrame,
-    model: genai.GenerativeModel,
+    client: genai.Client,
     prompts: dict[str, str],
 ) -> dict:
     """Call 1: ask Gemini to return JSON describing dimensions + recommended sections."""
@@ -90,9 +113,9 @@ def schema_discovery(
     for attempt in range(2):
         try:
             raw = _call_gemini(
-                model,
+                client,
                 prompt,
-                generation_config={"response_mime_type": "application/json"},
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
             data = _extract_json(raw)
             if "available_dimensions" not in data or "recommended_sections" not in data:
@@ -240,7 +263,7 @@ def _match_section(name: str) -> str | None:
 def generate_section(
     section_name: str,
     df: pd.DataFrame,
-    model: genai.GenerativeModel,
+    client: genai.Client,
     prompts: dict[str, str],
 ) -> str:
     """Call 2: build the data slice for a section and ask Gemini for the narrative."""
@@ -248,7 +271,37 @@ def generate_section(
     prompt_key, placeholder, builder = SECTION_BUILDERS[matched]
     data_text = builder(df)
     prompt = prompts[prompt_key].replace("{" + placeholder + "}", data_text)
-    return _call_gemini(model, prompt)
+    return _call_gemini(client, prompt)
+
+
+def generate_executive_commentary(client: genai.Client, briefing_text: str) -> str:
+    """Final pass: ask Gemini for a CHRO-level commentary on the assembled briefing."""
+    prompts = load_prompts()
+    prompt = prompts["PROMPT_7"].replace("{briefing_text}", briefing_text)
+    return _call_gemini(client, prompt)
+
+
+def qa_mode(client: genai.Client, briefing_text: str) -> None:
+    """Interactive RAG Q&A loop — answers grounded in the briefing context only."""
+    prompts = load_prompts()
+    template = prompts["PROMPT_8"]
+    print("[Q&A] Briefing ready. Ask questions about this report (type 'exit' to quit):")
+    while True:
+        try:
+            question = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not question:
+            continue
+        if question.lower() == "exit":
+            return
+        prompt = template.replace("{briefing_text}", briefing_text).replace(
+            "{user_question}", question
+        )
+        answer = _call_gemini(client, prompt)
+        print(answer)
+        print()
 
 
 def build_document(
@@ -293,20 +346,29 @@ def build_document(
 def main() -> None:
     prompts = load_prompts()
     df = data_loader()
-    model = _configure_gemini()
+    client = _configure_gemini()
 
-    schema = schema_discovery(df, model, prompts)
+    schema = schema_discovery(df, client, prompts)
     print(f"[schema] dimensions: {schema['available_dimensions']}")
     print(f"[schema] sections:   {schema['recommended_sections']}")
 
     sections: list[tuple[str, str]] = []
     for section_name in schema["recommended_sections"]:
         print(f"[generating] {section_name}")
-        narrative = generate_section(section_name, df, model, prompts)
+        narrative = generate_section(section_name, df, client, prompts)
         sections.append((section_name, narrative))
+
+    print("[commentary] Generating Strategic Executive Commentary...")
+    briefing_text = "\n\n".join(f"## {name}\n\n{narrative}" for name, narrative in sections)
+    commentary = generate_executive_commentary(client, briefing_text)
+    sections.append(("Strategic Executive Commentary", commentary))
 
     out = build_document(sections)
     print(f"[done] wrote {out}")
+
+    if "--qa" in sys.argv[1:]:
+        full_briefing = "\n\n".join(f"## {name}\n\n{narrative}" for name, narrative in sections)
+        qa_mode(client, full_briefing)
 
 
 if __name__ == "__main__":
