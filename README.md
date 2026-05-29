@@ -9,6 +9,14 @@ The AI Executive Briefing Generator is a Python tool that ingests an HR analytic
 
 ---
 
+## Business Impact
+
+Writing a briefing like this manually takes an HR analyst 4 to 6 hours: pulling the data, computing the statistics, writing narrative across multiple sections, and compiling a formatted document. This tool produces the same output in under 90 seconds, with no manual steps after the script runs.
+
+For HR teams that produce recurring workforce reports (monthly, quarterly, or after engagement surveys), this means analyst time shifts from document production to strategic interpretation. The briefing adapts automatically to any HR dataset with the same column structure, making it reusable across clients, business units, or reporting cycles.
+
+---
+
 ## Architecture — Two-Call Gemini Flow
 
 ```
@@ -71,6 +79,8 @@ The AI Executive Briefing Generator is a Python tool that ingests an HR analytic
 
 ## What the Tool Produces
 
+![Sample Briefing Output](assets/sample_briefing_preview.png)
+
 A professional `.docx` executive briefing containing:
 
 - **Title page header** — "Workforce Executive Briefing" with the generation date.
@@ -86,9 +96,10 @@ Every paragraph references specific figures derived from the dataset; the narrat
 
 ## Key Capabilities
 
+- **One API call per section (deliberate design)** — Each briefing section is generated in a separate Gemini call with its own focused data slice. This is a conscious trade-off: more API calls in exchange for higher-quality, data-specific narrative. Combining all sections into one call would reduce cost but produce generic output. Quality of analysis takes priority over API efficiency.
 - **Two-call architecture** — Schema discovery and narrative generation are separated, so the briefing structure adapts to whatever dataset is supplied without code changes.
 - **Strict JSON contract with retry** — Call 1 must return parseable JSON; the pipeline retries once and fails clearly otherwise.
-- **Prompt/code separation** — All six prompts live in `prompts.md`. Editing the tone, structure, or section instructions requires no Python changes.
+- **Prompt/code separation** — All all prompts live in `prompts.md`. Editing the tone, structure, or section instructions requires no Python changes.
 - **Deterministic data slices** — Each section is grounded in a reproducible aggregation computed by pandas, not in the model's recall.
 - **Lenient section routing** — If Gemini renames a section (e.g. "Overall Attrition Overview" vs "Attrition Analysis"), keyword matching still routes the correct data slice to the correct prompt.
 - **Credential hygiene** — API keys are loaded from `.env`; no secrets in source.
@@ -112,7 +123,7 @@ Create a `.env` file in the project root:
 GEMINI_API_KEY=your_api_key_here
 ```
 
-A free key from [Google AI Studio](https://aistudio.google.com/app/apikey) is sufficient — the pipeline uses six calls per run.
+A free key from [Google AI Studio](https://aistudio.google.com/app/apikey) is sufficient — the pipeline uses 7+ calls per run: one for schema discovery, one per section, and one for the Chief HR Officer strategic commentary.
 
 ### 3. Run the generator
 
@@ -151,7 +162,7 @@ Sales, at 20.6% — the highest of the three departments...
 > exit
 ```
 
-This implements **context-grounded Q&A using the RAG (Retrieval-Augmented Generation) pattern**: the full assembled briefing — every section plus the Strategic Executive Commentary — is injected as context with each question, and Gemini is instructed (via `PROMPT_8` in `prompts.md`) to answer **only** from that context and to say so plainly when the briefing does not cover a question. Answers are therefore grounded in the report, not in the model's general knowledge. Omit `--qa` to skip Q&A and exit after the document is written (existing default behaviour).
+This implements **context-grounded Q&A using the RAG (Retrieval-Augmented Generation) pattern**: the full assembled briefing — every section plus the Strategic Executive Commentary — is injected as context with each question, and Gemini is instructed (via `PROMPT_8` in `prompts.md`) to answer **only** from that context and to say so plainly when the briefing does not cover a question. Answers are therefore grounded in the report, not in the model's general knowledge. Omit `--qa` to skip Q&A and exit after the document is written (existing default behaviour). A browser-based interface with drag-and-drop CSV upload and integrated chat is planned for v1.3 via Streamlit.
 
 ### 5. Automated Mode
 
@@ -184,8 +195,11 @@ ai-executive-briefing-generator/
 ├── CLAUDE.md                # Project spec and architecture rules
 ├── README.md
 ├── briefing_generator.py    # Pipeline entry point
+├── watcher.py               # Folder watcher for automated mode
 ├── prompts.md               # Prompt library (all 6 prompts)
 ├── requirements.txt
+├── assets/
+│   └── sample_briefing_preview.png  # README preview image
 ├── data/
 │   └── sample_input.csv     # IBM HR Analytics dataset (1,470 rows, 35 cols)
 └── output/

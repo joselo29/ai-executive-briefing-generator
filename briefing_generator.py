@@ -70,15 +70,15 @@ def _call_gemini(client: genai.Client, prompt: str, **kwargs) -> str:
                 model=MODEL_NAME, contents=prompt, **kwargs
             )
             return (response.text or "").strip()
-        except genai_errors.APIError as exc:
+        except (genai_errors.ServerError, genai_errors.ClientError) as exc:
             code = getattr(exc, "code", None)
             if code not in _RETRY_CODES or attempt >= len(_RETRY_WAITS):
                 raise
             wait = _RETRY_WAITS[attempt]
             attempt += 1
             print(
-                f"[retry] Gemini overloaded — waiting {wait}s and retrying "
-                f"(attempt {attempt}/3)...",
+                f"[retry] Gemini unavailable (code {code}) — waiting {wait}s and "
+                f"retrying (attempt {attempt}/3)...",
                 file=sys.stderr,
             )
             time.sleep(wait)
@@ -236,12 +236,35 @@ def _risk_data(df: pd.DataFrame) -> str:
     )
 
 
+def _compensation_data(df: pd.DataFrame) -> str:
+    income_by_dept = df.groupby("Department")["MonthlyIncome"].mean().round(0).to_dict()
+    role_income = (
+        df.groupby("JobRole")["MonthlyIncome"].mean().round(0).sort_values(ascending=False)
+    )
+    top_roles = role_income.head(5).to_dict()
+    bottom_roles = role_income.tail(5).to_dict()
+    income_by_perf = (
+        df.groupby("PerformanceRating")["MonthlyIncome"].mean().round(0).to_dict()
+    )
+    income_by_overtime = (
+        df.groupby("OverTime")["MonthlyIncome"].mean().round(0).to_dict()
+    )
+    return (
+        f"Average MonthlyIncome by Department: {income_by_dept}\n"
+        f"Top 5 JobRoles by average MonthlyIncome: {top_roles}\n"
+        f"Bottom 5 JobRoles by average MonthlyIncome: {bottom_roles}\n"
+        f"Average MonthlyIncome by PerformanceRating (1-4): {income_by_perf}\n"
+        f"Average MonthlyIncome by OverTime status: {income_by_overtime}\n"
+    )
+
+
 SECTION_BUILDERS = {
     "Executive Summary": ("PROMPT_2", "executive_summary_data", _executive_summary_data),
     "Attrition Analysis": ("PROMPT_3", "attrition_data", _attrition_data),
     "Satisfaction & Engagement": ("PROMPT_4", "satisfaction_data", _satisfaction_data),
     "Department Performance": ("PROMPT_5", "department_data", _department_data),
     "Risks & Recommendations": ("PROMPT_6", "risk_data", _risk_data),
+    "Compensation & Reward Strategy": ("PROMPT_9", "compensation_data", _compensation_data),
 }
 
 
@@ -253,6 +276,8 @@ def _match_section(name: str) -> str | None:
         return "Attrition Analysis"
     if "satisf" in n or "engage" in n or "morale" in n:
         return "Satisfaction & Engagement"
+    if "compensation" in n or "reward" in n or "pay" in n or "salary" in n:
+        return "Compensation & Reward Strategy"
     if "department" in n or "performance" in n:
         return "Department Performance"
     if "risk" in n or "recommend" in n:
@@ -275,7 +300,7 @@ def generate_section(
 
 
 def generate_executive_commentary(client: genai.Client, briefing_text: str) -> str:
-    """Final pass: ask Gemini for a CHRO-level commentary on the assembled briefing."""
+    """Final pass: ask Gemini for a Chief HR Officer-level commentary on the assembled briefing."""
     prompts = load_prompts()
     prompt = prompts["PROMPT_7"].replace("{briefing_text}", briefing_text)
     return _call_gemini(client, prompt)
