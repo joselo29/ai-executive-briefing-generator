@@ -99,7 +99,7 @@ Every paragraph references specific figures derived from the dataset; the narrat
 - **One API call per section (deliberate design)** — Each briefing section is generated in a separate Gemini call with its own focused data slice. This is a conscious trade-off: more API calls in exchange for higher-quality, data-specific narrative. Combining all sections into one call would reduce cost but produce generic output. Quality of analysis takes priority over API efficiency.
 - **Two-call architecture** — Schema discovery and narrative generation are separated, so the briefing structure adapts to whatever dataset is supplied without code changes.
 - **Strict JSON contract with retry** — Call 1 must return parseable JSON; the pipeline retries once and fails clearly otherwise.
-- **Prompt/code separation** — All all prompts live in `prompts.md`. Editing the tone, structure, or section instructions requires no Python changes.
+- **Prompt/code separation** — All prompts live in `prompts.md`. Editing the tone, structure, or section instructions requires no Python changes.
 - **Deterministic data slices** — Each section is grounded in a reproducible aggregation computed by pandas, not in the model's recall.
 - **Lenient section routing** — If Gemini renames a section (e.g. "Overall Attrition Overview" vs "Attrition Analysis"), keyword matching still routes the correct data slice to the correct prompt.
 - **Credential hygiene** — API keys are loaded from `.env`; no secrets in source.
@@ -196,7 +196,7 @@ ai-executive-briefing-generator/
 ├── README.md
 ├── briefing_generator.py    # Pipeline entry point
 ├── watcher.py               # Folder watcher for automated mode
-├── prompts.md               # Prompt library (all 6 prompts)
+├── prompts.md               # Prompt library (all prompts)
 ├── requirements.txt
 ├── assets/
 │   └── sample_briefing_preview.png  # README preview image

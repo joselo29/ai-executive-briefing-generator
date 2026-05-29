@@ -16,6 +16,8 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 from dotenv import load_dotenv
 
@@ -73,6 +75,15 @@ def _call_gemini(client: genai.Client, prompt: str, **kwargs) -> str:
         except (genai_errors.ServerError, genai_errors.ClientError) as exc:
             code = getattr(exc, "code", None)
             if code not in _RETRY_CODES or attempt >= len(_RETRY_WAITS):
+                if code == 429:
+                    print(
+                        "[error] Gemini quota exhausted (429 RESOURCE_EXHAUSTED). The free tier "
+                        "allows 20 requests/day for gemini-2.5-flash, and a full run uses 7+. "
+                        "Wait for the daily quota to reset, use a different GEMINI_API_KEY, or "
+                        "enable billing — then re-run.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
                 raise
             wait = _RETRY_WAITS[attempt]
             attempt += 1
@@ -258,6 +269,36 @@ def _compensation_data(df: pd.DataFrame) -> str:
     )
 
 
+_EDUCATION_LABELS = {1: "Below College", 2: "College", 3: "Bachelor", 4: "Master", 5: "Doctor"}
+
+
+def _demographic_data(df: pd.DataFrame) -> str:
+    age = df.copy()
+    age["AgeBucket"] = pd.cut(
+        age["Age"],
+        bins=[0, 29, 40, 50, 200],
+        labels=["Under 30", "30-40", "40-50", "Over 50"],
+    )
+    by_age = (
+        age["AgeBucket"]
+        .value_counts()
+        .reindex(["Under 30", "30-40", "40-50", "Over 50"])
+        .to_dict()
+    )
+    by_gender = df["Gender"].value_counts().to_dict()
+    by_marital = df["MaritalStatus"].value_counts().to_dict()
+    education = df["Education"].map(_EDUCATION_LABELS).fillna(df["Education"].astype(str))
+    by_education = education.value_counts().to_dict()
+    by_dept = df["Department"].value_counts().to_dict()
+    return (
+        f"Age distribution by bucket: {by_age}\n"
+        f"Gender split: {by_gender}\n"
+        f"MaritalStatus breakdown: {by_marital}\n"
+        f"Education level distribution: {by_education}\n"
+        f"Headcount by Department: {by_dept}\n"
+    )
+
+
 SECTION_BUILDERS = {
     "Executive Summary": ("PROMPT_2", "executive_summary_data", _executive_summary_data),
     "Attrition Analysis": ("PROMPT_3", "attrition_data", _attrition_data),
@@ -265,6 +306,7 @@ SECTION_BUILDERS = {
     "Department Performance": ("PROMPT_5", "department_data", _department_data),
     "Risks & Recommendations": ("PROMPT_6", "risk_data", _risk_data),
     "Compensation & Reward Strategy": ("PROMPT_9", "compensation_data", _compensation_data),
+    "Demographic & Organizational Insights": ("PROMPT_10", "demographic_data", _demographic_data),
 }
 
 
@@ -278,11 +320,28 @@ def _match_section(name: str) -> str | None:
         return "Satisfaction & Engagement"
     if "compensation" in n or "reward" in n or "pay" in n or "salary" in n:
         return "Compensation & Reward Strategy"
+    if "career" in n or "progression" in n or "development" in n:
+        return "Department Performance"
+    if "demographic" in n or "organizational" in n or "diversity" in n:
+        return "Demographic & Organizational Insights"
     if "department" in n or "performance" in n:
         return "Department Performance"
     if "risk" in n or "recommend" in n:
         return "Risks & Recommendations"
     return None
+
+
+_MD_HEADING_RE = re.compile(r"^\s*#{1,6}.*$", re.MULTILINE)
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_MD_ITALIC_RE = re.compile(r"\*(.+?)\*", re.DOTALL)
+
+
+def _strip_markdown(text: str) -> str:
+    """Strip markdown heading lines and bold/italic markers from Gemini's prose."""
+    text = _MD_HEADING_RE.sub("", text)
+    text = _MD_BOLD_RE.sub(r"\1", text)  # **bold** -> bold (before italic, so ** isn't half-matched)
+    text = _MD_ITALIC_RE.sub(r"\1", text)  # *italic* -> italic
+    return text.strip()
 
 
 def generate_section(
@@ -296,14 +355,14 @@ def generate_section(
     prompt_key, placeholder, builder = SECTION_BUILDERS[matched]
     data_text = builder(df)
     prompt = prompts[prompt_key].replace("{" + placeholder + "}", data_text)
-    return _call_gemini(client, prompt)
+    return _strip_markdown(_call_gemini(client, prompt))
 
 
 def generate_executive_commentary(client: genai.Client, briefing_text: str) -> str:
     """Final pass: ask Gemini for a Chief HR Officer-level commentary on the assembled briefing."""
     prompts = load_prompts()
     prompt = prompts["PROMPT_7"].replace("{briefing_text}", briefing_text)
-    return _call_gemini(client, prompt)
+    return _strip_markdown(_call_gemini(client, prompt))
 
 
 def qa_mode(client: genai.Client, briefing_text: str) -> None:
@@ -329,11 +388,64 @@ def qa_mode(client: genai.Client, briefing_text: str) -> None:
         print()
 
 
+def _add_horizontal_rule(doc: Document) -> None:
+    """Add an empty paragraph carrying a bottom border, used as a section divider."""
+    paragraph = doc.add_paragraph()
+    p_pr = paragraph._p.get_or_add_pPr()
+    borders = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "1F3A5F")
+    borders.append(bottom)
+    p_pr.append(borders)
+
+
+def _kpi_metrics(df: pd.DataFrame) -> list[tuple[str, str]]:
+    """Compute the four headline workforce metrics for the KPI summary table."""
+    total = len(df)
+    attr_rate = (df["Attrition"] == "Yes").mean() * 100
+    avg_sat = df["JobSatisfaction"].mean()
+    overtime_share = (df["OverTime"] == "Yes").mean() * 100
+    return [
+        ("Total Headcount", f"{total:,}"),
+        ("Overall Attrition Rate", f"{attr_rate:.1f}%"),
+        ("Average Job Satisfaction", f"{avg_sat:.1f} / 4"),
+        ("Employees on Overtime", f"{overtime_share:.1f}%"),
+    ]
+
+
+def _add_kpi_table(doc: Document, df: pd.DataFrame) -> None:
+    """Add the 'Key Workforce Metrics' label and a two-column Metric/Value table."""
+    label = doc.add_heading("Key Workforce Metrics", level=2)
+    for run in label.runs:
+        run.font.color.rgb = RGBColor(0x1F, 0x3A, 0x5F)
+
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+
+    header_cells = table.rows[0].cells
+    for cell, text in zip(header_cells, ("Metric", "Value")):
+        cell.text = text
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.bold = True
+
+    for metric, value in _kpi_metrics(df):
+        row = table.add_row().cells
+        row[0].text = metric
+        row[1].text = value
+
+    doc.add_paragraph()
+
+
 def build_document(
     sections: list[tuple[str, str]],
+    df: pd.DataFrame,
     output_path: Path = OUTPUT_PATH,
 ) -> Path:
-    """Assemble the final .docx with title, date, and one heading per section."""
+    """Assemble the final .docx with title, date, KPI table, and one heading per section."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc = Document()
 
@@ -357,12 +469,16 @@ def build_document(
 
     doc.add_paragraph()
 
-    for name, narrative in sections:
+    _add_kpi_table(doc, df)
+
+    for index, (name, narrative) in enumerate(sections):
         heading = doc.add_heading(name, level=1)
         for run in heading.runs:
             run.font.color.rgb = RGBColor(0x1F, 0x3A, 0x5F)
         for paragraph in [p.strip() for p in narrative.split("\n\n") if p.strip()]:
             doc.add_paragraph(paragraph)
+        if index < len(sections) - 1:
+            _add_horizontal_rule(doc)
 
     doc.save(output_path)
     return output_path
@@ -388,7 +504,7 @@ def main() -> None:
     commentary = generate_executive_commentary(client, briefing_text)
     sections.append(("Strategic Executive Commentary", commentary))
 
-    out = build_document(sections)
+    out = build_document(sections, df)
     print(f"[done] wrote {out}")
 
     if "--qa" in sys.argv[1:]:
